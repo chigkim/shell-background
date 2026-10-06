@@ -77,6 +77,12 @@ export default function shellBackground(pi: ExtensionAPI) {
   // deliver through the now-stale pi handle. Each instance has its own copy
   // (reload builds a fresh closure), so this only ever flips once, on the way out.
   let handedOff = false;
+  // Finished jobs waiting for the agent loop to end before they are delivered.
+  // Holding them lets a shell_status call later in the same turn collect a job
+  // and cancel its delivery: deciding at exit time always beats the poll, so
+  // the result arrived twice (pifydev/shell-background#2).
+  let busy = false;
+  const pending: Job[] = [];
 
   const ROOT = join(tmpdir(), "pify-shell-bg");
   const MAX_SESSION_DIR_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -241,6 +247,17 @@ export default function shellBackground(pi: ExtensionAPI) {
   const waiters = new Map<string, number>();
   const awaited = (job: Job): boolean => (waiters.get(job.id) ?? 0) > 0;
 
+  /** Deliver every held job that nothing collected meanwhile, unless a turn is still running. */
+  function flushPending(): void {
+    if (busy || handedOff) return;
+    for (const job of pending.splice(0)) {
+      if (job.delivered) continue;
+      job.delivered = true;
+      registry?.persist(job);
+      deliver(job);
+    }
+  }
+
   /** Deliver a finished background job into the conversation, once. */
   function scheduleDelivery(job: Job, exit: Promise<unknown>): void {
     exit
@@ -254,9 +271,8 @@ export default function shellBackground(pi: ExtensionAPI) {
           return;
         }
         if (job.delivered || awaited(job)) return;
-        job.delivered = true;
-        registry?.persist(job);
-        deliver(job);
+        pending.push(job);
+        flushPending();
       })
       .catch(() => {
         // A /reload can make captured handles throw; delivery is a convenience,
@@ -641,10 +657,9 @@ export default function shellBackground(pi: ExtensionAPI) {
           }
         }
         if (job.status === "running") anyRunning = true;
-        else if (!job.delivered && !awaited(job)) {
-          job.delivered = true;
-          registry.persist(job);
-          deliver(job);
+        else if (!job.delivered && !awaited(job) && !pending.includes(job)) {
+          pending.push(job);
+          flushPending();
         }
       }
       renderWidget(ctx);
@@ -652,6 +667,19 @@ export default function shellBackground(pi: ExtensionAPI) {
     }, 1000);
     timer.unref?.();
   }
+
+  pi.on("agent_start", async () => {
+    busy = true;
+  });
+
+  pi.on("agent_end", async () => {
+    busy = false;
+    try {
+      flushPending();
+    } catch {
+      // Delivery is a convenience; shell_status still collects the result.
+    }
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     const warnings = loadSettings(ctx.cwd);
